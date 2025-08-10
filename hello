@@ -1,0 +1,295 @@
+/* ===================== DCPT (corrected; names per your mapping) ===================== */
+
+/* 3) Summary costs per share-class (sum FEE_AMT in the run window) */
+summary_shareclass_costs AS (
+  SELECT
+      sc.portfoliocode,
+      sc.child_cusip,
+      p.start_date,                 -- summary run window
+      p.end_date,
+      sc.sc_start_date,             -- share class start
+      sc.sc_end_date,               -- share class close (NULL = open)
+      s.FEE_TYPE,
+      SUM(s.FEE_AMT) AS fee_amt
+  FROM {{ summary_cost_table }} s
+  JOIN shareclasses sc
+    ON sc.child_cusip = s.SC_CUSIP
+  JOIN periods p
+    ON p.portfoliocode = sc.portfoliocode
+  WHERE s.START_DATE >= p.start_date
+    AND s.END_DATE   <= p.end_date
+  GROUP BY 1,2,3,4,5,6,7
+),
+
+/* 4) Base (remove any unconditional oldest ADL401 unions) */
+base AS (
+  SELECT * FROM summary_shareclass_costs
+),
+
+/* 5) Tokenise FEE_TYPE = source_feetype_assettype_isind (asset ignored = all-asset) */
+bucket_tokens AS (
+  SELECT
+      b.portfoliocode,
+      b.child_cusip,
+      b.start_date, b.end_date,
+      b.sc_start_date, b.sc_end_date,
+      UPPER(SPLIT_PART(b.FEE_TYPE,'_',1)) AS src,
+      UPPER(SPLIT_PART(b.FEE_TYPE,'_',2)) AS code,
+      UPPER(SPLIT_PART(b.FEE_TYPE,'_',4)) AS dir_ind,
+      b.fee_amt
+  FROM base b
+),
+
+/* 6) Map into reporting buckets (non-annualised) */
+dept_costs AS (
+  SELECT
+      portfoliocode,
+      child_cusip,
+      start_date, end_date,
+      sc_start_date, sc_end_date,
+
+      /* 02030 → txn_cost_lend_borrow (FUNDFEE OOC110/119/120 DIR) */
+      SUM(CASE WHEN src='FUNDFEE' AND code IN ('OOC110','OOC119','OOC120') AND dir_ind='DIR'
+               THEN fee_amt ELSE 0 END) AS txn_cost_lend_borrow,
+
+      /* 02040 → txn_tax (INCLUDE these TRDCHARGE codes), DIR */
+      SUM(CASE WHEN src='TRDCHARGE'
+                    AND code IN ('COUN','FTRX','LOCL','STAM','STEX','TRAN','TRAX','VATA','WITH','HAIR','SLIP')
+                    AND dir_ind='DIR'
+               THEN fee_amt ELSE 0 END) AS txn_tax,
+
+      /* 02050 parts (IND) → fees_charge (no TRDCHARGE here per your latest rule) */
+      SUM(CASE WHEN src='TCOST'   AND code='PRIIPS2' AND dir_ind='IND' THEN fee_amt ELSE 0 END) AS fees_charge_tcost_ind,
+      SUM(CASE WHEN src='FUNDFEE' AND code='PTC502'  AND dir_ind='IND' THEN fee_amt ELSE 0 END) AS fees_charge_ptc502_ind,
+      SUM(CASE WHEN src='FUNDFEE' AND code='ADL401'  AND dir_ind='IND' THEN fee_amt ELSE 0 END) AS fees_charge_adl_ind,
+
+      /* 02060 parts (DIR) → implicit_cost */
+      SUM(CASE WHEN src='TCOST'   AND code='PRIIPS2' AND dir_ind='DIR' THEN fee_amt ELSE 0 END) AS implicit_cost_tcost_dir,
+      SUM(CASE WHEN src='FUNDFEE' AND code='PTC502'  AND dir_ind='DIR' THEN fee_amt ELSE 0 END) AS implicit_cost_ptc502_dir,
+
+      /* 02070 → ind_cost = TRDCHARGE *_IND EXCEPT HAIR, SLIP (no asset filter) */
+      SUM(CASE WHEN src='TRDCHARGE' AND dir_ind='IND' AND code NOT IN ('HAIR','SLIP')
+               THEN fee_amt ELSE 0 END) AS ind_cost,
+
+      /* 02080 → anti_dilution (ADL401 DIR negative) */
+      SUM(CASE WHEN src='FUNDFEE' AND code='ADL401' AND dir_ind='DIR'
+               THEN -fee_amt ELSE 0 END) AS anti_dilution,
+
+      /* 02090 → lend_borrow_cost (reported separately) */
+      SUM(CASE WHEN src='FUNDFEE' AND code='OOC110' AND dir_ind='DIR'
+               THEN fee_amt ELSE 0 END) AS lend_borrow_cost,
+
+      /* 03010 → admin_charge */
+      SUM(CASE
+            WHEN src='FUNDFEE' AND LEFT(code,3)='OOC'
+                 AND code NOT IN ('OOC110','OOC119','OOC120','OOC901','OOC905','OOC906')
+                 AND dir_ind IN ('DIR','IND') THEN fee_amt
+            WHEN src='FUNDFEE' AND code IN ('INC301','INC302')
+                 AND dir_ind IN ('DIR','IND') THEN fee_amt
+            ELSE 0 END) AS admin_charge
+  FROM bucket_tokens
+  GROUP BY 1,2,3,4,5,6
+),
+
+/* 7) Combine split parts + compute 02020 (non-annualised) → txn_cost_buy_sell */
+dept_costs_total AS (
+  SELECT
+      d.*,
+      (implicit_cost_tcost_dir + implicit_cost_ptc502_dir) AS implicit_cost,
+      (fees_charge_tcost_ind + fees_charge_ptc502_ind + fees_charge_adl_ind) AS fees_charge,
+      /* 02020 (Requirements) = 02040 + 02060 + 02070 + 02080 */
+      (txn_tax + (implicit_cost_tcost_dir + implicit_cost_ptc502_dir) + ind_cost + anti_dilution)
+        AS txn_cost_buy_sell
+  FROM dept_costs d
+),
+
+/* 8) Oldest share-class per fund (parent = oldest share class) */
+oldest_share_class AS (
+  SELECT portfoliocode, MIN(sc_start_date) AS oldest_sc_start_date
+  FROM shareclasses
+  GROUP BY 1
+),
+
+/* 9) Oldest share-class sums over the same window (no scaling) */
+oldest_window AS (
+  SELECT
+      s.portfoliocode,
+      s.start_date, s.end_date,
+      SUM(s.txn_cost_lend_borrow)             AS o02030,
+      SUM(s.txn_tax)                          AS o02040,
+      SUM(s.fees_charge_tcost_ind)            AS o050_tcost_ind,
+      SUM(s.fees_charge_ptc502_ind)           AS o050_ptc502_ind,
+      SUM(s.fees_charge_adl_ind)              AS o050_adl_ind,
+      SUM(s.implicit_cost_tcost_dir)          AS o060_tcost_dir,
+      SUM(s.implicit_cost_ptc502_dir)         AS o060_ptc502_dir,
+      SUM(s.ind_cost)                         AS o02070,
+      SUM(s.anti_dilution)                    AS o02080
+  FROM dept_costs s
+  JOIN oldest_share_class os
+    ON os.portfoliocode = s.portfoliocode
+  WHERE s.sc_start_date = os.oldest_sc_start_date
+  GROUP BY 1,2,3
+),
+
+/* 10) Scenario flags */
+sc_flags AS (
+  SELECT
+      t.*,
+      DATEDIFF('day', t.sc_start_date, t.end_date) AS days_sc,
+      IFF(t.sc_end_date IS NULL OR t.sc_end_date > t.end_date, 0, 1) AS closed_before_end
+  FROM dept_costs_total t
+),
+
+sc_with_oldest AS (
+  SELECT
+      f.*,
+      os.oldest_sc_start_date,
+      DATEDIFF('day', os.oldest_sc_start_date, f.end_date) AS days_oldest,
+      IFF(os.oldest_sc_start_date < f.sc_start_date, 1, 0) AS older_exists
+  FROM sc_flags f
+  JOIN oldest_share_class os
+    ON os.portfoliocode = f.portfoliocode
+),
+
+/* 11) Assign scenarios + ratios */
+sc_scen AS (
+  SELECT
+      w.*,
+      IFF(w.days_sc >= 365 AND w.closed_before_end = 0, 'S0',
+      IFF(w.days_sc <  365 AND w.closed_before_end = 0 AND w.older_exists = 0, 'S1',
+      IFF(w.days_sc <  365 AND w.closed_before_end = 0 AND w.older_exists = 1 AND w.days_oldest >= 365, 'S2',
+      IFF(w.days_sc <  365 AND w.closed_before_end = 0 AND w.older_exists = 1 AND w.days_oldest <  365, 'S3', 'S4')))) AS scen,
+      365.25 / NULLIF(DATEDIFF('day', w.sc_start_date,        w.end_date), 0) AS r_sc,
+      365.25 / NULLIF(DATEDIFF('day', w.oldest_sc_start_date, w.end_date), 0) AS r_oldest,
+      365.25 / NULLIF(DATEDIFF('day', w.start_date,           w.sc_end_date), 0) AS r_close
+  FROM sc_with_oldest w
+),
+
+/* 12) Apply annualisation rules (parent = oldest) */
+annualised_costs AS (
+  SELECT
+      v.portfoliocode, v.child_cusip,
+      v.start_date, v.end_date, v.sc_start_date, v.sc_end_date,
+      v.scen,
+
+      /* FUNDFEE (exclude ADL401): scale by r_sc in S1–S3; r_close in S4 */
+      CASE v.scen WHEN 'S0' THEN v.txn_cost_lend_borrow
+                  WHEN 'S1' THEN v.txn_cost_lend_borrow * v.r_sc
+                  WHEN 'S2' THEN v.txn_cost_lend_borrow * v.r_sc
+                  WHEN 'S3' THEN v.txn_cost_lend_borrow * v.r_sc
+                  ELSE             v.txn_cost_lend_borrow * v.r_close END AS a_txn_cost_lend_borrow,
+
+      /* fees_charge (IND; FUNDFEE/TCOST components only per your rule) */
+      CASE v.scen WHEN 'S0' THEN v.fees_charge_ptc502_ind
+                  WHEN 'S1' THEN v.fees_charge_ptc502_ind * v.r_sc
+                  WHEN 'S2' THEN v.fees_charge_ptc502_ind * v.r_sc
+                  WHEN 'S3' THEN v.fees_charge_ptc502_ind * v.r_sc
+                  ELSE             v.fees_charge_ptc502_ind * v.r_close END AS a_fees_charge_ptc502_ind,
+
+      CASE v.scen WHEN 'S0' THEN v.txn_tax
+                  WHEN 'S1' THEN v.txn_tax * v.r_sc
+                  WHEN 'S2' THEN ow.o02040                -- parent window
+                  WHEN 'S3' THEN ow.o02040 * v.r_oldest
+                  ELSE             v.txn_tax * v.r_close END AS a_txn_tax,
+
+      CASE v.scen WHEN 'S0' THEN v.ind_cost
+                  WHEN 'S1' THEN v.ind_cost * v.r_sc
+                  WHEN 'S2' THEN ow.o02070                -- parent window
+                  WHEN 'S3' THEN ow.o02070 * v.r_oldest
+                  ELSE             v.ind_cost * v.r_close END AS a_ind_cost,
+
+      CASE v.scen WHEN 'S0' THEN v.implicit_cost_tcost_dir
+                  WHEN 'S1' THEN v.implicit_cost_tcost_dir * v.r_sc
+                  WHEN 'S2' THEN ow.o060_tcost_dir
+                  WHEN 'S3' THEN ow.o060_tcost_dir * v.r_oldest
+                  ELSE             v.implicit_cost_tcost_dir * v.r_close END AS a_implicit_cost_tcost_dir,
+
+      CASE v.scen WHEN 'S0' THEN v.implicit_cost_ptc502_dir
+                  WHEN 'S1' THEN v.implicit_cost_ptc502_dir * v.r_sc
+                  WHEN 'S2' THEN ow.o060_ptc502_dir
+                  WHEN 'S3' THEN ow.o060_ptc502_dir * v.r_oldest
+                  ELSE             v.implicit_cost_ptc502_dir * v.r_close END AS a_implicit_cost_ptc502_dir,
+
+      CASE v.scen WHEN 'S0' THEN v.fees_charge_tcost_ind
+                  WHEN 'S1' THEN v.fees_charge_tcost_ind * v.r_sc
+                  WHEN 'S2' THEN ow.o050_tcost_ind
+                  WHEN 'S3' THEN ow.o050_tcost_ind * v.r_oldest
+                  ELSE             v.fees_charge_tcost_ind * v.r_close END AS a_fees_charge_tcost_ind,
+
+      CASE v.scen WHEN 'S0' THEN v.fees_charge_adl_ind
+                  WHEN 'S1' THEN v.fees_charge_adl_ind * v.r_sc
+                  WHEN 'S2' THEN ow.o050_adl_ind          -- parent window
+                  WHEN 'S3' THEN ow.o050_adl_ind * v.r_oldest
+                  ELSE             v.fees_charge_adl_ind * v.r_close END AS a_fees_charge_adl_ind,
+
+      CASE v.scen WHEN 'S0' THEN v.anti_dilution
+                  WHEN 'S1' THEN v.anti_dilution * v.r_sc
+                  WHEN 'S2' THEN ow.o02080                -- ADL401 DIR from parent window (already negative)
+                  WHEN 'S3' THEN ow.o02080 * v.r_oldest
+                  ELSE             v.anti_dilution * v.r_close END AS a_anti_dilution,
+
+      /* 02090 (lend_borrow_cost): FUNDFEE → treat like FUNDFEE excl ADL401 (scale) */
+      CASE v.scen WHEN 'S0' THEN v.lend_borrow_cost
+                  WHEN 'S1' THEN v.lend_borrow_cost * v.r_sc
+                  WHEN 'S2' THEN v.lend_borrow_cost * v.r_sc
+                  WHEN 'S3' THEN v.lend_borrow_cost * v.r_sc
+                  ELSE             v.lend_borrow_cost * v.r_close END AS a_lend_borrow_cost,
+
+      /* 03010 (admin_charge): treat like FUNDFEE excl ADL401 (scale) */
+      CASE v.scen WHEN 'S0' THEN v.admin_charge
+                  WHEN 'S1' THEN v.admin_charge * v.r_sc
+                  WHEN 'S2' THEN v.admin_charge * v.r_sc
+                  WHEN 'S3' THEN v.admin_charge * v.r_sc
+                  ELSE             v.admin_charge * v.r_close END AS a_admin_charge
+
+  FROM sc_scen v
+  LEFT JOIN oldest_window ow
+    ON ow.portfoliocode = v.portfoliocode
+   AND ow.start_date    = v.start_date
+   AND ow.end_date      = v.end_date
+),
+
+/* 13) Recombine annualised parts + 02020 (annualised) → txn_cost_buy_sell */
+annualised_totals AS (
+  SELECT
+      a.portfoliocode, a.child_cusip,
+      a.start_date, a.end_date,
+      a.sc_start_date, a.sc_end_date,
+      a.scen,
+
+      /* implicit_cost & fees_charge (assembled from parts) */
+      (a.a_implicit_cost_tcost_dir + a.a_implicit_cost_ptc502_dir)                        AS implicit_cost,
+      (a.a_fees_charge_tcost_ind  + a.a_fees_charge_ptc502_ind + a.a_fees_charge_adl_ind) AS fees_charge,
+
+      /* individual lines */
+      a.a_txn_cost_lend_borrow    AS txn_cost_lend_borrow,   -- 02030
+      a.a_txn_tax                 AS txn_tax,                 -- 02040
+      a.a_ind_cost                AS ind_cost,               -- 02070
+      a.a_anti_dilution           AS anti_dilution,          -- 02080
+      a.a_lend_borrow_cost        AS lend_borrow_cost,       -- 02090
+      a.a_admin_charge            AS admin_charge,           -- 03010
+
+      /* 02020: txn_cost_buy_sell = 02040 + 02060 + 02070 + 02080 */
+      (a.a_txn_tax + (a.a_implicit_cost_tcost_dir + a.a_implicit_cost_ptc502_dir) + a.a_ind_cost + a.a_anti_dilution)
+        AS txn_cost_buy_sell
+
+  FROM annualised_costs a
+),
+
+/* 14) 02010 aggregation from annualised values → txn_cost_agg */
+dcpt AS (
+  SELECT
+      t.*,
+      CASE
+        WHEN (txn_cost_buy_sell + txn_cost_lend_borrow - anti_dilution) > -anti_dilution
+             OR (-anti_dilution) < 0
+          THEN txn_cost_buy_sell + txn_cost_lend_borrow
+        WHEN (txn_cost_buy_sell - anti_dilution) < 0
+          THEN txn_cost_buy_sell + txn_cost_lend_borrow - anti_dilution
+        ELSE 0.00
+      END AS txn_cost_agg
+  FROM annualised_totals t
+)
+
+/* Final */
+SELECT * FROM dcpt;
